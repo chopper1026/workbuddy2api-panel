@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -445,8 +446,20 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
+	// 会话头族补齐（issue #188 渠道校验）：官方客户端三件套缺一即 400 11128
+	// "conversation id missing"。本路径手搓头、不经 ChatHeaders，此前只有
+	// X-Conversation-ID，且 X-Request-ID 是毫秒字符串（非 32 hex 形态）。
+	//   - X-Conversation-ID 保持 wb2api-conv-<nano>：该值与返回给调用方、写进上报
+	//     事件链的 conversationId 必须同源（expert_actual_use 等 JOIN 判据）；
+	//   - X-Conversation-Request-ID 由 conversationID 派生 32 hex：轮级聚合主键需
+	//     UUID 形态（原始 nano 串不是），派生保证形态合法且同会话稳定；
+	//   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 hex）。
+	convReqID := session.RequestIDForKey(conversationID)
+	msgID := session.NewMessageID()
 	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+	h.Set("X-Conversation-Request-ID", convReqID)
+	h.Set("X-Conversation-Message-ID", msgID)
+	h.Set("X-Request-ID", msgID)
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")

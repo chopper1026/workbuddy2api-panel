@@ -41,6 +41,14 @@ func TestClassify(t *testing.T) {
 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
+		// 渠道校验失败（issue #188，**与上一组同码不同因**）：11128 也承载
+		// "conversation id missing"，那是网关会话头缺失（请求头问题）——必须与内容
+		// 审核分开：换号无用（头是网关自己发的）、不能走降级重试（缺的头不会因为
+		// 换提示词而补上）。这两条与上方 content_blocked 用例互为回归护栏。
+		{400, `{"code":11128,"msg":"conversation id missing"}`, ErrChannelInvalid},
+		{400, `conversation id missing`, ErrChannelInvalid},
+		// 上游若改用其它状态码回该文案也要分流（不落 ErrServer 让账号背熔断）。
+		{503, `{"code":11128,"msg":"conversation id missing"}`, ErrChannelInvalid},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。

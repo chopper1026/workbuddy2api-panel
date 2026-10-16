@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.23-alpine AS build
+# 国内构建：容器内 go mod download 默认走 proxy.golang.org（被墙），改走七牛代理。
+# 海外构建可用 --build-arg GOPROXY=https://proxy.golang.org,direct 覆盖回官方源。
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download

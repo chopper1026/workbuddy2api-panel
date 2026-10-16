@@ -65,6 +65,11 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 		// （handler_test 的泄漏守卫），hint 遵守同一口径。
 		return "request content was rejected by content policy; adjust the prompt and retry"
+	case ErrChannelInvalid:
+		// 渠道校验失败（issue #188）：上游国际版网关要求会话头三件套，缺失即拒。
+		// 网关已恒发（injectConversationHeaders）；此 hint 出现意味着上游又收紧了
+		// 校验规则——重试无用，需按上游 error.message 里的 requestId 反馈排查。
+		return "upstream rejected the request: channel verification requires conversation headers the gateway did not satisfy; retrying will not help"
 	default:
 		// ErrNone/ErrNotFound/ErrServer/ErrBadParams/ErrClient 等未覆盖形态：无 hint。
 		return ""
