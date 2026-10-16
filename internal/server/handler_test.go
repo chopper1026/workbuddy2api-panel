@@ -189,6 +189,53 @@ func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
 	}
 }
 
+// TestChatChannelInvalidFailsFast 渠道校验失败（issue #188，11128 "conversation id
+// missing"）必须 fail-fast 400 透传，而不是轮转后报 503 no_healthy_account。
+//
+// 三条断言对应三个被修掉的错误行为：
+//  1. 只打上游 1 次（缺头与账号无关，换号必撞同一校验——轮转纯属放大请求）；
+//  2. 响应 400 + code=channel_invalid（503 会被客户端读成"服务端过载"并无限重试）；
+//  3. 账号零惩罚（此前落 ErrClient 兜底 → 连败 5 次健康号被降权 10 分钟，是本 issue
+//     "国际版模型频繁 503"体感恶化的直接推手）。
+func TestChatChannelInvalidFailsFast(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 400, `{"code":11128,"msg":"conversation id missing"}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0) // 确定性源 r=0 → 先选 bad
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400: channel verification is not retryable by rotating accounts)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 0 {
+		t.Errorf("calls=%v want bad 1 次、good 0 次（零轮转）", calls)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "channel_invalid") {
+		t.Errorf("body should carry code=channel_invalid: %s", body)
+	}
+	if strings.Contains(body, "no_healthy_account") {
+		t.Errorf("channel verification failure must not be reported as account exhaustion: %s", body)
+	}
+	// 上游原文透传（含 11128 与 requestId，用户要拿去向上游反馈）。
+	if !strings.Contains(body, "conversation id missing") {
+		t.Errorf("body should carry the upstream message verbatim: %s", body)
+	}
+	// 账号完好：无冷却、无禁用、无熔断计数、无连败计数、无 errTotal。
+	st, _ := p.Status("bad")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 || st.ConsecutiveFails != 0 {
+		t.Errorf("ErrChannelInvalid must not penalize account: %+v", st)
+	}
+}
+
 func TestChatNonStreamAggregates(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz != "Bearer at1" {

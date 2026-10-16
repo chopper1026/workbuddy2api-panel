@@ -185,7 +185,7 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
+	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则由 convReqID 稳定派生兜底（见 injectConversationHeaders）
 	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
 }
@@ -254,10 +254,20 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
-// injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
+// injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合 +
+// issue #188 渠道校验）。
+//
+// **渠道校验（issue #188）**：上游国际版网关（www.workbuddy.ai）对
+// POST /v2/chat/completions 新增渠道校验——`X-Conversation-ID` /
+// `X-Conversation-Request-ID` / `X-Conversation-Message-ID` 三件套缺任一个即回
+// HTTP 400 `code:11128 "conversation id missing"`（国内 copilot.tencent.com 不校验）。
+// 该错误分类前落 ErrClient → 被当普通 4xx 换号，健康账号连败 5 次后还被降权，
+// 末端报成 503 no_healthy_account（假"服务端过载"，客户端无限重试）。
+// 故三件套改为**恒发**：`X-Conversation-ID` 不再因 body 缺 conversationId 而省略。
+//
 // 头族分四层，各司其职：
-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
-//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
+//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。**必发**——
+//     客户端给了就透传原值；没给则由 convReqID 稳定派生兜底（不伪造随机值，见下）。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
 //     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
 //   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
@@ -266,6 +276,16 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 //   - X-B3-TraceId / X-B3-SpanId / X-B3-Sampled：链路族。B3 规范只认 16/32 hex
 //     TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId 回落
 //     messageID（恒 32 hex），SpanId 取 messageID[:16]（每消息新）。
+//
+// 兜底为何是**派生**而非随机（两处硬约束）：
+//   - 用 session.RequestIDForKey(convReqID)：进程盐 + 键的纯派生，同键恒同值、
+//     异键互异、重启换新（会话已结束，不构成断档，与 RequestIDForKey 头注同论述）。
+//     随机值会让同一会话的每轮落进不同"会话"，上游后台按会话聚合的台账直接碎片化。
+//   - 只改本函数内的局部变量，**绝不回写 meta.ConversationID**：该值同时是
+//     prepareBody → InjectPromptCacheKey 的 prompt_cache_key 会话段来源
+//     （cache_key.go）。回写会让缓存键随每轮漂移，前缀缓存命中归零、费用按
+//     cache_key.go 实测上涨约 17×。空值下 buildCacheKey 的会话段由 uid 单独哈希、
+//     同账号恒定 —— 与修复前行为逐字一致（零回归）。
 func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
@@ -273,10 +293,15 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		// 本级补一个 32 hex，调用方（handler）已生成稳定的不走到这里。
 		convReqID = session.NewMessageID()
 	}
-	messageID := session.NewMessageID()
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	// X-Conversation-ID 恒发：客户端原值优先，缺失则按 convReqID 稳定派生兜底。
+	// 不打日志：本函数在轮转循环内每次出站都会调用，逐请求打印会把日志刷满；
+	// 上游若再收紧校验，分类层（ErrChannelInvalid）会带原文透出，无需此处留痕。
+	convID := meta.ConversationID
+	if convID == "" {
+		convID = session.RequestIDForKey(convReqID)
 	}
+	messageID := session.NewMessageID()
+	req.Header.Set("X-Conversation-ID", convID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)

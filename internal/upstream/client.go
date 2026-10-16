@@ -41,6 +41,7 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrChannelInvalid                // 11128「conversation id missing」→ 渠道校验失败（网关会话头缺失，非账号问题）：不罚号、不轮转，末端 400 透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -68,6 +69,8 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrChannelInvalid:
+		return "channel_invalid"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrClient:
@@ -152,6 +155,23 @@ var contentBlockedMarkers = []string{
 	"unapproved channel",
 	"illegal api invocation",
 }
+
+// channelInvalidMarkers 渠道校验失败关键词（issue #188，子串匹配）。
+//
+// 与 contentBlockedMarkers **同码不同因**：code 11128 承载两种完全不同的语义——
+//   - "blocked by security policy" → 内容审核（ErrContentBlocked，误报，走降级重试）；
+//   - "conversation id missing"    → 渠道校验（上游国际版网关要求会话头三件套，
+//     网关漏发所致）。
+//
+// 后者必须与前者分开：它是**请求头**问题，换账号不改变结果（头是网关自己发的），
+// 却被更宽的 4xx 兜底归为 ErrClient → 只换号不避让，且连败 5 次后健康号被降权
+// （pool.NoteFailures），末端报成 503 no_healthy_account —— 客户端读成"服务端过载"
+// 并无限重试。故单列 ErrChannelInvalid：不罚号、不轮转、400 透传原文。
+//
+// 文案唯一无歧义（上游 11128 的三类语义中，仅此条描述请求头缺失），故用子串判定；
+// "first message is not system prompt" 形态不收录——首条非 system 已由
+// ensureConsoleSystem 在出站前补齐（payload.go），不会到达分类层。
+var channelInvalidMarkers = []string{"conversation id missing"}
 
 // badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
@@ -544,6 +564,19 @@ func Classify(status int, body string) ErrKind {
 		for _, m := range promptTooLongMarkers {
 			if strings.Contains(body, m) || (m != strings.ToLower(m) && strings.Contains(lower, strings.ToLower(m))) {
 				return ErrPromptTooLong
+			}
+		}
+	}
+	// 渠道校验失败（issue #188）：判在 404/5xx 兜底与内容策略之前——与 11128
+	// 「blocked by security policy」**同码不同因**：此处是会话头缺失（请求头问题），
+	// 必须抢在 contentBlockedMarkers 前分流，否则会被内容审核语义吞掉——那走
+	// 降级重试，而渠道校验降级重试无用（缺的头不会因为换提示词而补上）。
+	// 也不得落 status>=500 兜底（ErrServer 只喂熔断，账号无头问题却背罚）。
+	// 不限状态码：上游实测回 400，但语义唯一无歧义，宽松判给未来状态码变化留余量。
+	if status >= 400 {
+		for _, m := range channelInvalidMarkers {
+			if strings.Contains(lower, m) {
+				return ErrChannelInvalid
 			}
 		}
 	}

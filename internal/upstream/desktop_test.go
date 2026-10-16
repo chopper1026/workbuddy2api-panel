@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -117,5 +118,48 @@ func TestSetAppearanceTheme(t *testing.T) {
 	}
 	if got["kind"] != "theme" || got["resource_key"] != "theme-tkmw7j" {
 		t.Errorf("body=%v want kind=theme resource_key=theme-tkmw7j", got)
+	}
+}
+
+// TestDesktopChatWithExpertSendsConversationTrio DesktopChatWithExpert 手搓头、
+// 不经 ChatHeaders——此前只有 X-Conversation-ID，缺轮级/消息级两头，且 X-Request-ID
+// 是毫秒字符串（非 32 hex）。上游国际版渠道校验要求三件套齐全（issue #188），
+// 该路径被 panel/autotask.go 的真实对话判据调用（global 账号走国际版网关）。
+func TestDesktopChatWithExpertSendsConversationTrio(t *testing.T) {
+	var convID, convReqID, msgID, reqID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		convID = r.Header.Get("X-Conversation-ID")
+		convReqID = r.Header.Get("X-Conversation-Request-ID")
+		msgID = r.Header.Get("X-Conversation-Message-ID")
+		reqID = r.Header.Get("X-Request-ID")
+		w.Write([]byte("data: {\"id\":\"0123456789abcdef0123456789abcdef\",\"choices\":[]}\n\n"))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	conversationID, serverReqID, err := c.DesktopChatWithExpert(&auth.Auth{AccessToken: "at", UID: "u1"}, "")
+	if err != nil {
+		t.Fatalf("DesktopChatWithExpert: %v", err)
+	}
+	if convID == "" || convReqID == "" || msgID == "" {
+		t.Fatalf("trio must all be non-empty: convID=%q convReqID=%q msgID=%q (issue #188 channel check)", convID, convReqID, msgID)
+	}
+	// 三件套须为 32 hex（官方客户端形态）。
+	for name, v := range map[string]string{
+		"X-Conversation-Request-ID": convReqID,
+		"X-Conversation-Message-ID": msgID,
+		"X-Request-ID":              reqID,
+	} {
+		if len(v) != 32 || strings.Trim(v, "0123456789abcdef") != "" {
+			t.Errorf("%s=%q want 32 hex chars", name, v)
+		}
+	}
+	// 返回给调用方的 conversationId 必须与出站 X-Conversation-ID 同源：
+	// 上报事件链（expert_actual_use 等）靠它 JOIN 会话。
+	if convID != conversationID {
+		t.Errorf("header X-Conversation-ID=%q want returned conversationID=%q", convID, conversationID)
+	}
+	if serverReqID != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("serverReqID=%q want the SSE stream id", serverReqID)
 	}
 }

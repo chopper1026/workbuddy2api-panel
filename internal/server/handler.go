@@ -942,6 +942,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 渠道校验失败（issue #188）：与上两个分支同一哲学——会话头是**网关自己发的**，
+			// 缺头与账号无关，换任何号都会撞同一校验（11128 "conversation id missing"）。
+			// 轮转只会把同一个必然失败的请求放大 MaxRotate 倍打上游风控，末端还会被
+			// 当成"账号全挂"报 503，客户端于是无限重试。立即 400 透传原文：
+			// 客户端据此能看出是渠道校验问题（而非"稍后重试"），运维侧也一眼可见。
+			// 归因提示：网关已恒发会话头三件套（injectConversationHeaders），此分支
+			// 若出现说明上游又收紧了校验——错误原文带 requestId，可直接拿去反馈。
+			if kind == upstream.ErrChannelInvalid {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream rejected the request: conversation channel headers missing"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "channel_invalid", msg,
+					h.hintOf(upstream.ErrChannelInvalid, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -1157,6 +1177,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 客户端据此会不断重试（#81 里就是 503 → 客户端自动重试 5 次），而真正
 			// 该做的是换个模型。用 400 + 明确的 code 把不可重试的性质讲清楚。
 			code = "model_unavailable"
+			status = http.StatusBadRequest
+		case upstream.ErrChannelInvalid:
+			// 渠道校验失败（issue #188）：同 ErrModelBlocked 的哲学——重试无意义，
+			// 不该报 503 让客户端自动重试。轮转循环内已 fail-fast（此分支是防御性
+			// 兜底：只有在 kind 未经循环分支到达末端时才走到，例如未来新增调用路径）。
+			code = "channel_invalid"
 			status = http.StatusBadRequest
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
@@ -1406,6 +1432,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrImageInvalid:
 		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
+	case upstream.ErrChannelInvalid:
+		// 渠道校验失败（11128 "conversation id missing"）：会话头是**网关自己发的**，
+		// 与账号健康完全无关（同一请求换任何号都会撞同一校验）。零动作——不冷却/
+		// 不熔断/不 NoteError/不 NoteFailures（本类是 issue #188 前 ErrClient 兜底
+		// 把健康号连败降权的原因，绝不能回到那条路径）。
+		// 修复面在上游侧头注入（injectConversationHeaders 已恒发三件套）；此分支
+		// 只为「上游再收紧校验」时留痕——chatCompletions 已 fail-fast 400 透传原文。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关侧不再截断，均为客户端畸形 JSON）。换了账号照样 400，
