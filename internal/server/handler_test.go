@@ -829,6 +829,179 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	}
 }
 
+// apisix401Page 上游网关（APISIX/openresty）拒绝凭证时返回的 401 错误页原样形态
+// （2026-10-18 实测）：无任何业务 code/msg 字段，分类器无法当场定性。
+const apisix401Page = `<html>
+<head><title>401 Authorization Required</title></head>
+<body>
+<center><h1>401 Authorization Required</h1></center>
+<hr><center>openresty</center>
+<p><em>Powered by <a href="https://apisix.apache.org/">APISIX</a>.</em></p>
+</body>
+</html>
+`
+
+// refreshInvalidGrant 上游刷新端点确定性失效的实测原文（refresh token 已被撤销）。
+const refreshInvalidGrant = `{"code":12153,"msg":"12153:refresh token failed:400 Bad Request: invalid_grant: Session doesn't have required client","requestId":"d7d1f444"}`
+
+// fakeResp 构造假上游响应（Content-Type 决定流式/非流式解析路径）。
+func fakeResp(status int, ct, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{ct}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+// waitPoolStatus 轮询等待账号状态满足条件（异步探针用）。
+func waitPoolStatus(t *testing.T, p *pool.Pool, uid string, what string, cond func(pool.Status) bool) pool.Status {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if st, ok := p.Status(uid); ok && cond(st) {
+			return st
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	st, _ := p.Status(uid)
+	t.Fatalf("等待超时: %s (status=%+v)", what, st)
+	return st
+}
+
+// TestChatAuthRejected401ExitsRotation 401 + 无业务信封（2026-10-18 实测形态）：
+//   - 该账号**立刻退出选号**（此前落 ErrClient 只换号不罚 → 账号以「可用」身份
+//     反复接流量，实测潜伏 8 小时）；
+//   - 本轮请求照常轮转到健康号并成功；
+//   - 刷新探针确认确定性失效（invalid_grant）后禁用（需人工重登）。
+func TestChatAuthRejected401ExitsRotation(t *testing.T) {
+	// 探针响应用闸门卡住：先断言「账号已退出选号」（同步部分），再放行探针断言判死。
+	release := make(chan struct{})
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+				<-release
+				return fakeResp(401, "application/json", refreshInvalidGrant), nil
+			}
+			if r.Header.Get("Authorization") == "Bearer at-bad" {
+				return fakeResp(401, "text/html", apisix401Page), nil
+			}
+			return fakeResp(200, "text/event-stream", sseOK), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", RefreshToken: "rt-bad", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0) // 确定性随机源 + 高积分 → 先选 bad
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("轮转后应成功: code=%d body=%s", rec.Code, rec.Body)
+	}
+	// 同步部分：坏号立即退出选号（面板不再显示「可用」）。
+	bad, _ := p.Status("bad")
+	if !bad.Cooling || bad.Until.IsZero() || bad.Disabled {
+		t.Fatalf("401 账号应立刻进入探针期冷却（尚未定性）: %+v", bad)
+	}
+	for _, uid := range p.AvailableUIDs() {
+		if uid == "bad" {
+			t.Fatal("坏号不应留在健康候选集里")
+		}
+	}
+	// 异步部分：刷新端点确认确定性失效 → 禁用。
+	close(release)
+	bad = waitPoolStatus(t, p, "bad", "确定性失效禁用", func(st pool.Status) bool { return st.Disabled })
+	if !strings.Contains(bad.DisabledReason, "invalid_grant") {
+		t.Errorf("disabled_reason=%q 应含 invalid_grant", bad.DisabledReason)
+	}
+	if good, _ := p.Status("good"); good.Cooling || good.Disabled {
+		t.Errorf("健康号不应被牵连: %+v", good)
+	}
+}
+
+// TestChatAuthRejectedTransientRecovers 401 无信封但刷新成功（瞬时抖动/网关侧拒绝）
+// → 账号**不判死**：只保留探针期短冷却，到期自动回池（P0-1 误杀防护）。
+// 单号池下本轮请求失败，末端 code 用专属的 account_auth_rejected（不是
+// no_healthy_account——后者会被客户端读成「服务端过载」而无限重试）。
+func TestChatAuthRejectedTransientRecovers(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+				return fakeResp(200, "application/json", `{"code":0,"data":{"accessToken":"new-at","refreshToken":"new-rt","expiresIn":3600,"domain":"www.codebuddy.cn"}}`), nil
+			}
+			return fakeResp(401, "text/html", apisix401Page), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	acct := &auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"}
+	p := testPoolWith(acct)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("单号池应回 503: code=%d", rec.Code)
+	}
+	var e struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil || e.Error.Code != "account_auth_rejected" {
+		t.Fatalf("error.code=%q want account_auth_rejected (body=%s)", e.Error.Code, rec.Body)
+	}
+	// 探针跑完（拿到新 token）后账号仍活着：只有短冷却，不判死。
+	waitPoolStatus(t, p, "u1", "探针刷新成功（token 已更新）", func(pool.Status) bool { return acct.AccessTokenValue() == "new-at" })
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Fatalf("刷新成功不应禁用账号: %+v", st)
+	}
+	if !st.Cooling {
+		t.Fatalf("短冷却应仍在（到期自动回池）: %+v", st)
+	}
+}
+
+// TestChatPreRefreshSessionDeadDeterministic 请求前刷新（token 临近过期）失败的分流：
+// 确定性 invalid_grant 一次即禁用；无确定性文案的 12153 保留 3 连击容错（不误杀）。
+func TestChatPreRefreshSessionDeadDeterministic(t *testing.T) {
+	newHandler := func(refreshBody string) (*pool.Pool, *Handler) {
+		up := &upstream.Client{
+			HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+					return fakeResp(401, "application/json", refreshBody), nil
+				}
+				return fakeResp(200, "text/event-stream", sseOK), nil
+			})},
+			ChatBaseCN:    "https://fake.example",
+			BillingBaseCN: "https://fake.example",
+		}
+		p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 1}) // 已过期 → 必先刷新
+		return p, NewHandler(Config{Pool: p, Upstream: up})
+	}
+
+	t.Run("invalid_grant 立即判死", func(t *testing.T) {
+		p, h := newHandler(refreshInvalidGrant)
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		st, _ := p.Status("u1")
+		if !st.Disabled || !strings.Contains(st.DisabledReason, "invalid_grant") {
+			t.Fatalf("确定性失效应一次即禁用: %+v", st)
+		}
+	})
+	t.Run("瞬时 12153 只计次不判死", func(t *testing.T) {
+		p, h := newHandler(`{"code":12153,"msg":"Offline user session not found"}`)
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		st, _ := p.Status("u1")
+		if st.Disabled {
+			t.Fatalf("单次非确定性 12153 不应禁用: %+v", st)
+		}
+	})
+}
+
 func TestChatTransportErrorDoesNotPenalize(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	up := &upstream.Client{

@@ -13,6 +13,7 @@ func TestClassifyLine(t *testing.T) {
 		"streak-bonus 5c162cc9: 🎊 新手礼包 +100c":                           ChTask,
 		"blackcat c8a3e793: 完成 3 次夜间对话":                                 ChTask,
 		"checkin 5c162cc9: 已签到":                                         ChTask,
+		"auth-probe 5c162cc9: 12153（非确定性）— 计次，暂不禁用":                     ChTask,
 		"panel: 任务动作 uid=x code=chat_5":                                 ChTask,
 		"panel: 队列启动：6 项（并发 2）":                                         ChTask,
 		"panel: revive uid=x":                                           ChSys,

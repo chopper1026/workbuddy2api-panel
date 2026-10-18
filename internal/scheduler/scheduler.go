@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/authprobe"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -22,8 +23,11 @@ import (
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
-	Pool           *pool.Pool
-	Upstream       *upstream.Client
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	// AuthProbe 认证失效探针（凭证被拒的统一入口）：保号任务链路的 401/12153 接入与 chat
+	// 同一套处置（冷却 + 探针定性）。nil 时由 New 用 Pool+Upstream 构造。
+	AuthProbe      *authprobe.Prober
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -100,6 +104,12 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
+	}
+	if cfg.AuthProbe == nil {
+		// 认证失效探针缺省自建：保号任务链路的认证类失败此前只有一行
+		// 日志，账号既不冷却也不判死（实测死号潜伏 8 小时，余额任务每 10 分钟打一次
+		// 401 却毫无痕迹）。Pool/Upstream 缺失时为 nil（no-op，老测试零改动）。
+		cfg.AuthProbe = authprobe.New(cfg.Pool, cfg.Upstream)
 	}
 	return &Scheduler{
 		cfg:           cfg,
@@ -576,6 +586,8 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 它已经是终态，再计一次只会打出一行「— 禁用」的误导日志。
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
+// 例外是**确定性**失效（invalid_grant，见 upstream.IsDeterministicSessionDead）：
+// refresh token 已被上游撤销，等不来恢复，一次即禁用。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
 	includeDisabled := s.includeDisabledInTasks()
@@ -591,7 +603,15 @@ func (s *Scheduler) RunKeepaliveNow() {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
-				if s.cfg.Pool.NoteSessionDead(st.UID) {
+				// 确定性失效（invalid_grant = refresh token 已被上游撤销）一次即判死：
+				// 等不来恢复的形态不该占用 3 连击容错额度（否则按 keepalive 每日一次的
+				// 排程要 3 天才禁用，期间账号一直显示「可用」并接流量）。
+				// 无确定性文案的 12153 仍是瞬时抖动形态，保留既有连击语义。
+				if upstream.IsDeterministicSessionDead(ue.Msg) {
+					s.cfg.Pool.Disable(st.UID, authprobe.DisableReason)
+					log.Printf("keepalive %s: 刷新端点确定性失效（invalid_grant）— 已禁用（需重新登录）",
+						logfmt.Label(st.UID, st.Nickname))
+				} else if s.cfg.Pool.NoteSessionDead(st.UID) {
 					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
 			}
@@ -600,6 +620,42 @@ func (s *Scheduler) RunKeepaliveNow() {
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
+		}
+	}
+}
+
+// noteAuthFailure 保号任务链路的认证类失败统一出口（凭证被拒）：把 401/12153
+// 接进与 chat 路径同一套处置，终结「任务链路 401 只有一行日志、账号状态却毫无痕迹」
+// 的现状（实测：session 已死的账号在余额任务里连吃 50+ 次 401，面板仍显示「可用」，
+// 且一直参与选号接流量）。
+//
+//   - 12153 + 确定性文案（invalid_grant）→ 立即禁用（不占 3 连击容错额度）；
+//   - 12153（无确定性文案）→ 记一次 12153 计次（达阈禁用）；
+//   - 401 无业务信封（ErrAuthRejected）→ 冷却 + 刷新探针定性（authprobe）。
+//
+// 非认证类错误（超时/限流/网络抖动/业务错误）零动作：它们各有既有语义与惩罚入口，
+// 不在此追加第二份惩罚（两机制并存取更长者、不叠加）。scope 是日志行首标识
+// （如 "balance"），沿用各任务既有口径，面板日志页据此归入「任务」频道。
+func (s *Scheduler) noteAuthFailure(scope, uid string, err error) {
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		return
+	}
+	label := uid
+	if st, ok := s.cfg.Pool.Status(uid); ok {
+		label = logfmt.Label(uid, st.Nickname)
+	}
+	switch {
+	case ue.Kind == upstream.ErrSessionDead && upstream.IsDeterministicSessionDead(ue.Msg):
+		s.cfg.Pool.Disable(uid, authprobe.DisableReason)
+		log.Printf("%s %s: 刷新端点确定性失效（invalid_grant）— 已禁用（需重新登录）", scope, label)
+	case ue.Kind == upstream.ErrSessionDead:
+		if s.cfg.Pool.NoteSessionDead(uid) {
+			log.Printf("%s %s: 连续 %d 次 12153 session dead — 禁用", scope, label, pool.SessionDeadThreshold())
+		}
+	case ue.Kind == upstream.ErrAuthRejected:
+		if s.cfg.AuthProbe.CooldownAndProbe(uid, authprobe.CooldownReason, authprobe.DefaultCooldown) {
+			log.Printf("%s %s: 上游拒绝凭证（401，无业务信封）— 已退出选号，刷新探针定性中", scope, label)
 		}
 	}
 }
@@ -629,6 +685,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+				// 认证类失败接进池状态机：凭证被拒的账号退出选号并定性，
+				// 不再只留一行日志。余额任务 10 分钟一轮，是最早发现死号的观测点。
+				s.noteAuthFailure("balance", uid, err)
 				return
 			}
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)

@@ -32,6 +32,7 @@ const (
 	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
 	ErrSoftRate                      // 429 软限流 → 短冷却
 	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
+	ErrAuthRejected                  // 401 + 非业务信封（网关 HTML 错误页/空体）→ 冷却 + 刷新探针定性
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
@@ -53,6 +54,8 @@ func (k ErrKind) String() string {
 		return "soft_rate"
 	case ErrSessionDead:
 		return "session_dead"
+	case ErrAuthRejected:
+		return "auth_rejected"
 	case ErrNotFound:
 		return "not_found"
 	case ErrServer:
@@ -124,6 +127,28 @@ var softRateMarkers = []string{
 }
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
+
+// deterministicSessionDeadMarkers 刷新端点 12153 里**确定性**失效的文案
+// （大小写不敏感子串）。invalid_grant 是 OAuth 2.0（RFC 6749 §5.2）定义的
+// refresh grant 拒绝码：refresh token 已被撤销/替换，等待与重试都不会恢复，
+// 只能人工重登。它必须与「网络抖动/上游闪断/refresh 竞态」触发的瞬时 12153
+// 分开——后者才是 sessionDeadThreshold 三次容错要保护的形态，前者占用容错额度
+// 只会让死号多活几天（实测：一次 invalid_grant 后按 3 连击 + 每日
+// keepalive 排程，账号要 3 天才判死，期间一直显示「可用」并接流量）。
+var deterministicSessionDeadMarkers = []string{"invalid_grant"}
+
+// IsDeterministicSessionDead 报告 12153 的错误原文是否携带确定性失效文案
+// （见 deterministicSessionDeadMarkers）。msg 传上游错误原文（*Error.Msg 或
+// body）。仅用于**刷新调用**的 12153：chat 请求体的 12153 语义不变。
+func IsDeterministicSessionDead(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, m := range deterministicSessionDeadMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
 
 // accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
@@ -531,6 +556,26 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault
 		}
+	}
+	// 401 + 非业务信封（网关 HTML 错误页 / 空体 / 纯文本）：凭证被上游拒绝，但响应
+	// 没有业务 code/msg，**无法当场定性**「token 已死」还是「瞬时抖动/网关侧拒绝」。
+	// 单列 ErrAuthRejected，把定性交给处置侧的一次刷新探针（handler.applyErrorPolicy）：
+	// 探针报 12153/invalid_grant → 禁用；刷新成功 → 只保留短冷却。
+	//
+	// 为什么单列而不是复用 ErrSessionDead：后者是「确认死亡 → 禁用」的终态语义，
+	// 直接套用会让一次瞬时 401 误杀健康账号（P0-1：历史上 13 个被一次 12153 杀掉的
+	// 号复查全部刷新成功）。也不能留在 ErrClient 兜底：那是「只换号不罚、不轮转」
+	// 的请求级语义，账号既不冷却也不判死，会以「可用」身份反复被选中接流量
+	// （实测：账号 session 已死 8 小时，面板仍显示可用，余额任务每 10 分钟
+	// 打一次 401 却毫无痕迹）。
+	//
+	// 判据复用 hasBusinessEnvelope（与 IsWafBlocked 同源）：APISIX 的
+	// "401 Authorization Required" openresty 页正是「403 WAF 拦截页」的 401 变体。
+	// 必须排在 hardMarkers/softRateMarkers 之前——网关 401 页可能混排
+	// "rate limit"/"too many" 等措辞，落入 ErrSoftRate 会让死号以「限流冷却」的
+	// 温和形态留在池里反复被选中，正是本类要消灭的形态。
+	if status == http.StatusUnauthorized && !hasBusinessEnvelope(body) {
+		return ErrAuthRejected
 	}
 	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为
 	// 可自愈的软限流并在全池冷却时反复兜底选中（issue #175）。仅按结构化 code

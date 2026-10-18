@@ -28,9 +28,12 @@ type LogEntry struct {
 }
 
 // taskPrefixes 任务动作日志的行首标识（scheduler 与 panel 的既有口径）。
+// "auth-probe " 是认证失效探针的定性结果（凭证被拒：确定性失效判死 / 刷新成功
+// 回池），与 keepalive 同属账号生命周期事件，归「任务」频道便于运维查看。
 var taskPrefixes = []string{
 	"school ", "streak-bonus ", "travel ", "blackcat ", "lottery ",
 	"checkin ", "activity ", "keepalive ", "balance ", "user-resource ",
+	"auth-probe ",
 	"panel: 任务", "panel: 一键", "panel: checkin", "panel: 手动",
 	"panel: 队列", "panel: 券码",
 }

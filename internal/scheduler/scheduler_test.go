@@ -376,6 +376,90 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 	}
 }
 
+// TestRunKeepaliveDeterministicInvalidGrant 刷新端点报确定性失效（invalid_grant：
+// refresh token 已被上游撤销）时**一次即禁用**，不再等 3 连击——按 keepalive 每日
+// 一次的排程，3 连击意味着死号要挂 3 天（实测：账号一直显示「可用」并接流量）。
+func TestRunKeepaliveDeterministicInvalidGrant(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":12153,"msg":"12153:refresh token failed:400 Bad Request: invalid_grant: Session doesn't have required client","requestId":"x"}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 1, Domain: "www.codebuddy.cn"})
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+	s.RunKeepaliveNow() // 第 1 次即判死
+
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("确定性失效应一次即禁用: %+v", st)
+	}
+	if !strings.Contains(st.DisabledReason, "invalid_grant") {
+		t.Errorf("disabled_reason=%q 应含 invalid_grant", st.DisabledReason)
+	}
+}
+
+// TestBalanceAuthRejectedExitsRotation 余额任务的认证类失败不再只留一行日志：
+// 401 无业务信封 → 账号退出选号（此前满足于 log.Printf，死号可潜伏 8 小时），
+// 刷新探针确认确定性失效后禁用。
+func TestBalanceAuthRejectedExitsRotation(t *testing.T) {
+	// 探针响应用闸门卡住：先断言「账号已退出选号」，再放行断言判死。
+	release := make(chan struct{})
+	var refreshCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+			refreshCalls.Add(1)
+			<-release
+			w.WriteHeader(401)
+			w.Write([]byte(`{"code":12153,"msg":"12153:refresh token failed:400 Bad Request: invalid_grant: Session doesn't have required client"}`))
+			return
+		}
+		// 余额端点（其余路径）：网关 401 HTML 页。
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(401)
+		w.Write([]byte("<html><head><title>401 Authorization Required</title></head><body>openresty</body></html>"))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+	s.RunBalanceRefreshNow()
+
+	// 同步部分：账号立刻退出选号（不再只是日志）。
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.Until.IsZero() || !st.Until.After(time.Now()) || st.Disabled {
+		t.Fatalf("余额任务 401 应让账号退出选号（尚未定性）: %+v", st)
+	}
+	for _, uid := range p.AvailableUIDs() {
+		if uid == "u1" {
+			t.Fatal("冷却中的账号不应留在健康候选集里")
+		}
+	}
+	// 异步部分：探针确认确定性失效 → 禁用。
+	close(release)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if st, _ := p.Status("u1"); st.Disabled {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	st, _ = p.Status("u1")
+	if !st.Disabled || !strings.Contains(st.DisabledReason, "invalid_grant") {
+		t.Fatalf("探针应判死该账号: %+v", st)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Errorf("刷新探针调用次数=%d want 1", got)
+	}
+}
+
 func TestCheckinErrorDoesNotCrash(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)

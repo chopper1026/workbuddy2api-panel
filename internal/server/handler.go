@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/authprobe"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -36,6 +37,9 @@ type Config struct {
 	MaxRotate int    // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
+	// AuthProbe 认证失效探针（凭证被拒的统一入口）：401 无业务信封 → 退出选号 + 刷新探针定性。
+	// nil 时由 NewHandler 用 Pool+Upstream 构造；Pool 缺失时为 nil（no-op）。
+	AuthProbe *authprobe.Prober
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
@@ -133,6 +137,11 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
+	}
+	if cfg.AuthProbe == nil {
+		// 认证失效探针缺省自建：401 无业务信封的账号必须能退出选号，
+		// 不能因为调用方漏配而退回「只换号不罚」。Upstream 缺失时探针只冷却不定性。
+		cfg.AuthProbe = authprobe.New(cfg.Pool, cfg.Upstream)
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -792,7 +801,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					// 刷新端点报 12153：确定性文案（invalid_grant = refresh token 已被
+					// 撤销）立即判死；无确定性文案的 12153 保留 3 连击容错（瞬时抖动
+					// 形态，一次即杀会误伤——见 upstream.deterministicSessionDeadMarkers）。
+					if upstream.IsDeterministicSessionDead(ue.Msg) {
+						h.cfg.Pool.Disable(acct.UID, authprobe.DisableReason)
+					} else if h.cfg.Pool.NoteSessionDead(acct.UID) {
+						log.Printf("WARN: [server] chat refresh acct=%s: 连续 %d 次 12153 session dead — 禁用",
+							logfmt.Label(acct.UID, acct.Nickname), pool.SessionDeadThreshold())
+					}
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -1178,6 +1195,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 该做的是换个模型。用 400 + 明确的 code 把不可重试的性质讲清楚。
 			code = "model_unavailable"
 			status = http.StatusBadRequest
+		case upstream.ErrAuthRejected:
+			// 401 无业务信封：账号已被撤出轮转并在探针定性中，
+			// 客户端的正确动作就是「稍后重试/换号」——用专属 code 把「不是服务端
+			// 过载、是这个账号的凭证被拒」讲清楚，避免客户端读成 no_healthy_account
+			// 而无限重试。上游原文（HTML 错误页）仍按透传口径原样带给客户端。
+			code = "account_auth_rejected"
+			msg = "account credential was rejected by upstream; the account is out of rotation pending verification, please retry"
 		case upstream.ErrChannelInvalid:
 			// 渠道校验失败（issue #188）：同 ErrModelBlocked 的哲学——重试无意义，
 			// 不该报 503 让客户端自动重试。轮转循环内已 fail-fast（此分支是防御性
@@ -1328,7 +1352,7 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
 // 会立即 400 返回，其余种类 continue 换号（continue 前由 rotateBackoff 退避）。
 //
-// 十条路径，各司其职：
+// 十一条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
@@ -1339,6 +1363,10 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //     基数经 jitterDur 抖动（防多账号同相位冷却到期再聚团）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrAuthRejected → 短冷却 + 刷新探针（凭证被拒）：401 无业务信封，定性不了
+//     是死是抖——先让账号退出选号（不再显示「可用」、不再接流量），再由后台单飞
+//     探针用刷新端点定性：invalid_grant → Disable；非确定性 12153 → 记一次计次；
+//     刷新成功 → 只留短冷却，到期自动回池。详见 authprobe 包。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
 //   - ErrBadParams → 不罚账号，且与 ErrPromptTooLong/ErrImageInvalid 同待遇：
 //     调用方在轮转循环内即刻 400 透传原文终止（换号必然同样失败）。
@@ -1404,6 +1432,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
+	case upstream.ErrAuthRejected:
+		// 401 + 非业务信封（APISIX HTML 错误页/空体）：凭证被拒但当场定性不了。
+		// 处置两段，全在 authprobe 里（与保号任务链路共用同一入口）：
+		//   1) 同步短冷却——账号**立刻**退出选号，面板状态从「可用」变为冷却中，
+		//      全池兜底路径也不会把它当健康号反复选中；
+		//   2) 异步单飞探针——刷新端点定性：确定性失效（invalid_grant）→ 禁用；
+		//      非确定性 12153 → 记一次计次；刷新成功 → 只留短冷却，到期自动回池。
+		// 不喂 sessionDeadFails/NoteFailures：定性交给探针，避免双重计罚。
+		h.cfg.AuthProbe.CooldownAndProbe(uid, authprobe.CooldownReason, authprobe.DefaultCooldown)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。

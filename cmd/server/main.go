@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/authprobe"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -170,9 +171,14 @@ func main() {
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
 
+	// 认证失效探针（凭证被拒的统一入口）：handler 与 scheduler 共用**同一实例**——单飞表
+	// 共享后，同一个死号被 chat 与余额任务同时命中只会打一次刷新探针。
+	authProber := authprobe.New(p, up)
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
+		AuthProbe:      authProber,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
@@ -296,6 +302,7 @@ func main() {
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
+		AuthProbe:    authProber, // 与 scheduler 共用同一探针实例（单飞表共享）
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,

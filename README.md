@@ -478,18 +478,21 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 ### 错误分类与账号处置
 
-上游错误由 `Classify` 统一分类（判定优先级：余额耗尽 → session 失效 → 限流文案 → 状态码兜底），账号处置如下：
+上游错误由 `Classify` 统一分类（判定优先级：余额耗尽 → session 失效 → 账号级故障 → 凭证被拒 → 限流文案 → 状态码兜底），账号处置如下：
 
 | 分类 | 触发条件 | 账号处置 | 恢复 |
 |---|---|---|---|
 | 余额不足 | HTTP 402 / body 含余额关键词 | 硬冷却到**次日 04:00**（本地时区） | 签到（09/21 点）余额恢复自动解冻 |
 | 频控 | HTTP 429 / 限流文案（不限状态码） | 软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）。**`code 6004`（模型级）带「将在 … 重置」时**冷却到上游重置墙钟并豁免切模型（见[常见问题](#429-code6004模型级限流的冷却语义)） | 到期自动恢复 / 成功清零退避 |
-| Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
+| Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数。**例外**：刷新端点返回 `invalid_grant`（refresh token 已被上游撤销）属确定性失效，**一次即禁用** | 人工重新登录 |
+| 凭证被拒 | HTTP 401 且 body 无业务信封（网关 HTML 错误页 / 空体 / 纯文本） | 账号**立刻退出选号**（探针期短冷却 60s），随后用刷新端点做一次探针定性：`invalid_grant` → 禁用；非确定性 `12153` → 记一次计次；刷新成功 → 只保留短冷却、到期自动回池（不误杀）。chat / 余额 / 保活三条链路共用同一入口（`internal/authprobe`，同账号单飞） | 探针定性后自动判定；恢复同上 |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
 | 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
+
+**凭证被拒为什么要「先退出选号 + 探针定性」**：上游把「凭证不再被接受」表达成多种形态，其中 401 + 网关 HTML 错误页（APISIX `401 Authorization Required`）没有业务 code/msg，看不出是 session 已死还是瞬时抖动。落 4xx 兜底（只换号不罚）则账号既不冷却也不判死，会以「可用」身份反复被选中接流量（实测潜伏 8 小时，余额任务每 10 分钟打一次 401 却毫无痕迹、客户端连吃 503）；直接判死又会误杀瞬时抖动的健康账号（P0-1 教训）。故先冷却退出选号——状态立刻不再显示「可用」——再用刷新端点定性。
 
 请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。网关不做请求体截断与预拦截，`11101` 均为客户端发来的畸形 JSON。
 
@@ -821,8 +824,11 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 ### 账号管理
 
 - 多账号复制 `auths/workbuddy-<uid>.json` 即可，池启动时自动对齐目录
-- Session 失效账号被禁用（`disabled_reason` 透出在 `/status`）后，可用 `./login.sh` 重新登录覆盖凭证；已持久化 `disabled=true` 的账号可在源码侧调用 `Pool.ReviveDisabled(uid)` 复活（`state.json` 中清除 `disabled` 标志）
+- Session 失效账号被禁用（`disabled_reason` 透出在 `/status` 与面板卡片）后，**用同一账号重新登录**即可恢复：面板「添加账号」或 `./login.sh` 重登会覆盖同一个 `workbuddy-<uid>.json` 并走 `Pool.Add`（已存在的 uid 只换凭证、保留积分/用量/成本台账等历史）+ `Revive`（清禁用/冷却/熔断），面板登录免重启即时生效
+- **不要用「移除账号」来解决凭证失效**：移除会同时删除池内状态与凭证文件（不可恢复），历史统计（`token_usage` / `model_costs` / 成功计数 / 当日已签）随之清零；只有换账号（uid 变化）、账号确实不再使用、或凭证文件损坏时才需要移除
+- 已持久化 `disabled=true` 的账号也可在面板点「解冻」（`POST /panel/api/accounts/{uid}/revive`）或源码侧调用 `Pool.Revive(uid)` 复活（只清惩罚状态，**不修凭证**——凭证失效仍必须重登）
 - 备份 = `auths/`（凭证）+ `data/state.json`（池状态：积分 / 冷却 / 计数）；配置 Upstash 后状态另镜像至 Redis（7 天 TTL）
+- 用量与请求流水另存 `data/usage.json` / `data/request-logs/*.jsonl`，按 uid 分桶、不随账号移除清理
 
 ## 安全与合规
 
@@ -891,8 +897,9 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 ### 账号被 Disable 后如何恢复？
 
-- **用 `./login.sh` 重新登录**覆盖凭证，重启后自动回池；
-- 或源码侧调用 `Pool.ReviveDisabled(uid)` 清除 `disabled` 状态（`state.json` 同步刷新）。
+- **用同一账号重新登录**（面板「添加账号」或 `./login.sh`）覆盖凭证：命中同一个 uid → 只换凭证、保留历史统计，且清掉禁用/冷却/熔断；
+- 若只是被误判禁用、凭证本身有效，可在面板点「解冻」（或源码侧 `Pool.Revive(uid)`）清除 `disabled` 状态（`state.json` 同步刷新）；
+- 凭证已失效（如 `invalid_grant`）时「解冻」无用——解冻只清惩罚状态，救不回已撤销的 session，必须重登。
 
 ### 系统提示词被内容策略误杀怎么办？
 
@@ -917,8 +924,9 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
 | `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
 | 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
-| session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |
-| `ReviveDisabled` 人工复活 | `internal/pool/pool.go:951` |
+| session-dead 连续阈值 3 才禁用（`invalid_grant` 例外：一次即禁用） | `internal/pool/entry.go`（`sessionDeadThreshold`）、`internal/upstream/client.go`（`IsDeterministicSessionDead`） |
+| 401 无业务信封 → 退出选号 + 刷新探针定性 | `internal/upstream/client.go`（`Classify` 的 `ErrAuthRejected` 分支）、`internal/authprobe/authprobe.go` |
+| 人工复活（清禁用/冷却/熔断） | 面板 `POST /panel/api/accounts/{uid}/revive` → `internal/pool/state.go`（`Revive`） |
 | disabled 账号透出 `disabled_reason` | `internal/pool/pool.go:1162-1165` |
 | 硬冷却至次日 04:00 | `internal/pool/pool.go:882`（`CooldownUntilTomorrow4AM`） |
 | 软冷却退避封顶 2h | `internal/pool/pool.go:247`（`defaultSoftRateMax`） |

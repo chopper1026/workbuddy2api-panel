@@ -114,6 +114,16 @@ func TestClassify(t *testing.T) {
 		{403, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{403, `{"code":60001,"msg":"quota exceeded"}`, ErrHardCredit},
 		{403, `{"code":1,"msg":"unknown business error"}`, ErrClient},
+		// 401 带业务信封的仍走既有分类（分流不劫持业务 401）。
+		{401, `{"code":12153,"msg":"12153:refresh token failed:400 Bad Request: invalid_grant: Session doesn't have required client"}`, ErrSessionDead},
+		{401, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
+		// 401 + 无业务信封（2026-10-18 实测）：APISIX/openresty 的 "401 Authorization
+		// Required" HTML 页没有业务 code/msg，定性不了是「session 已死」还是瞬时抖动
+		// → ErrAuthRejected，由 handler 冷却 + 刷新探针定性。此前落 ErrClient：
+		// 只换号不罚、账号以「可用」身份反复接流量（实测潜伏 8 小时、客户端连吃 503）。
+		{401, apisix401HTML, ErrAuthRejected},
+		{401, ``, ErrAuthRejected},
+		{401, `Unauthorized`, ErrAuthRejected},
 		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
 		{400, `bad request`, ErrClient},
 		{429, ``, ErrSoftRate},
@@ -121,6 +131,40 @@ func TestClassify(t *testing.T) {
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// apisix401HTML 上游网关（APISIX/openresty）拒绝凭证时返回的 401 错误页原样形态
+// （2026-10-18 实测：无任何业务 code/msg 字段）。
+const apisix401HTML = `<html>
+<head><title>401 Authorization Required</title></head>
+<body>
+<center><h1>401 Authorization Required</h1></center>
+<hr><center>openresty</center>
+<p><em>Powered by <a href="https://apisix.apache.org/">APISIX</a>.</em></p>
+</body>
+</html>
+`
+
+// TestIsDeterministicSessionDead 刷新端点 12153 的确定性失效判定：invalid_grant
+// （RFC 6749 refresh grant 拒绝码）一次即判死；无该文案的 12153 保留 3 连击容错。
+func TestIsDeterministicSessionDead(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		// 实测原文（2026-10-18）：refresh token 已被上游撤销，等不来恢复。
+		{`12153:refresh token failed:400 Bad Request: invalid_grant: Session doesn't have required client`, true},
+		{`INVALID_GRANT`, true}, // 大小写不敏感（OAuth 错误码大小写不保证）
+		// 瞬时抖动形态（网络闪断/竞态）：不带确定性文案，保留 3 连击。
+		{`{"code":12153,"msg":"Offline user session not found"}`, false},
+		{`12153: refresh token failed: context deadline exceeded`, false},
+		{``, false},
+	}
+	for _, c := range cases {
+		if got := IsDeterministicSessionDead(c.msg); got != c.want {
+			t.Errorf("IsDeterministicSessionDead(%q)=%v want %v", c.msg, got, c.want)
 		}
 	}
 }

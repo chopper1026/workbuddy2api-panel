@@ -57,6 +57,11 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
 	case ErrSessionDead:
 		return "account session expired at upstream; the account is disabled until re-login"
+	case ErrAuthRejected:
+		// 401 + 非业务信封：网关已把该账号撤出轮转，正在用刷新探针
+		// 定性（确定性失效 → 禁用；刷新成功 → 短冷却到期自动回池）。客户端动作与
+		// 普通换号一致，故不承诺具体终态，只说「凭证被拒、已让位」。
+		return "account credential was rejected by upstream (no business detail); the gateway took this account out of rotation and is verifying it"
 	case ErrHardCredit:
 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
 	case ErrModelBlocked:
